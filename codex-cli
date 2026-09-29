@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
@@ -99,62 +99,6 @@ def home_for(state):
     return official_home()
 
 
-def runtime_home_path(name):
-    """Return the short path used to launch an aliased Codex home."""
-    return manager_home() / "homes" / name
-
-
-def runtime_home_for(state):
-    """Resolve the launch path while keeping the configured path unchanged.
-
-    macOS limits Unix-domain socket paths to a short fixed length.  Cockpit
-    CODEX_HOME values can exceed that limit, so an active alias is launched
-    through a short symlink owned by this manager.  The symlink lives under
-    the manager directory; credentials and other Codex files remain in the
-    configured target directory.
-    """
-    active = state.get("active")
-    target = home_for(state)
-    if not active:
-        return target
-    if not target.is_dir():
-        raise CxsError("当前 CODEX_HOME 目录不存在：%s" % target)
-
-    runtime = runtime_home_path(active)
-    runtime.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    # Replace only symlinks.  A real file or directory at this managed path
-    # is never removed; report it so the user can resolve the collision.
-    if runtime.is_symlink():
-        try:
-            if runtime.resolve() != target:
-                runtime.unlink()
-                runtime.symlink_to(target, target_is_directory=True)
-        except OSError as exc:
-            raise CxsError("无法更新运行时链接 %s：%s" % (runtime, exc))
-    elif runtime.exists():
-        raise CxsError(
-            "运行时路径已被非 symlink 文件占用：%s；请移走它后重试" % runtime
-        )
-    else:
-        try:
-            runtime.symlink_to(target, target_is_directory=True)
-        except OSError as exc:
-            raise CxsError("无法创建运行时链接 %s：%s" % (runtime, exc))
-    return runtime
-
-
-def remove_runtime_home(name, target):
-    """Remove this alias's link only when it still points to its old target."""
-    runtime = runtime_home_path(name)
-    if runtime.is_symlink():
-        try:
-            if runtime.resolve() == Path(target).expanduser().resolve():
-                runtime.unlink()
-        except OSError as exc:
-            raise CxsError("无法清理运行时链接 %s：%s" % (runtime, exc))
-
-
 def parse_assignment(assignment):
     prefix = "CODEX_HOME="
     if not assignment.startswith(prefix) or not assignment[len(prefix) :]:
@@ -174,8 +118,6 @@ def cmd_add(args):
     if old and old.get("CODEX_HOME") != str(path) and not args.force:
         raise CxsError("配置已存在：%s；如需改路径请加 --force" % name)
     state["profiles"][name] = {"CODEX_HOME": str(path)}
-    if state.get("active") == name:
-        runtime_home_for(state)
     save_state(state)
     print("已添加 %s -> CODEX_HOME=%s" % (name, path))
     return 0
@@ -206,7 +148,6 @@ def cmd_use(args):
     if not path.is_dir():
         raise CxsError("配置的 CODEX_HOME 已不存在：%s" % path)
     state["active"] = args.name
-    runtime_home_for(state)
     save_state(state)
     print("已全局使用 %s：CODEX_HOME=%s" % (args.name, path))
     return 0
@@ -225,9 +166,7 @@ def cmd_remove(args):
     state = load_state()
     if name not in state["profiles"]:
         raise CxsError("找不到配置：%s" % name)
-    target = state["profiles"][name]["CODEX_HOME"]
     del state["profiles"][name]
-    remove_runtime_home(name, target)
     if state.get("active") == name:
         state["active"] = None
         print("已删除 %s，并恢复 default：CODEX_HOME=%s" % (name, official_home()))
@@ -278,16 +217,72 @@ def find_real_codex():
     raise CxsError("找不到真实 codex；请检查 PATH，或设置 CODEX_REAL_BIN")
 
 
+DAEMON_SUBCOMMANDS = {
+    "resume",
+    "fork",
+}
+
+
+KNOWN_SUBCOMMANDS = {
+    "agents",
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "plugin",
+    "app-server",
+    "remote-control",
+    "app",
+    "completion",
+    "update",
+    "doctor",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "resume",
+    "queue",
+    "archive",
+    "delete",
+    "migrate-rollouts",
+    "unarchive",
+    "fork",
+    "cloud",
+    "features",
+    "help",
+    "exec-server",
+}
+
+
+def needs_no_daemon(codex_args):
+    """Return whether this invocation uses Codex's shared daemon path."""
+    if "--no-daemon" in codex_args:
+        return False
+    if not codex_args:
+        return True
+    first = codex_args[0]
+    if first in DAEMON_SUBCOMMANDS:
+        return True
+    if first in KNOWN_SUBCOMMANDS:
+        return False
+    # A prompt or a global option without a subcommand invokes the TUI.
+    return True
+
+
 def run_codex(codex_args):
     state = load_state()
     home = home_for(state)
-    runtime_home = runtime_home_for(state)
-    if not runtime_home.is_dir():
+    if not home.is_dir():
         raise CxsError("当前 CODEX_HOME 目录不存在：%s" % home)
     codex = find_real_codex()
     env = os.environ.copy()
-    env["CODEX_HOME"] = str(runtime_home)
-    os.execvpe(codex, [codex] + list(codex_args), env)
+    env["CODEX_HOME"] = str(home)
+    launch_args = list(codex_args)
+    if state.get("active") and needs_no_daemon(launch_args):
+        launch_args.insert(0, "--no-daemon")
+    os.execvpe(codex, [codex] + launch_args, env)
     return 0
 
 
@@ -296,8 +291,6 @@ def cmd_current(_args):
     active = state.get("active") or "default"
     print("Current: %s" % active)
     print("CODEX_HOME=%s" % home_for(state))
-    if state.get("active"):
-        print("Runtime CODEX_HOME=%s" % runtime_home_for(state))
     print("Config file: %s" % state_file())
     return 0
 

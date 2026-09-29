@@ -65,9 +65,6 @@ class CodexCliTest(unittest.TestCase):
     def test_shim_uses_selected_home_from_any_directory(self):
         self.run_manager("add", "jessica", "CODEX_HOME=" + str(self.jessica_home))
         self.run_manager("use", "jessica")
-        runtime_home = self.state_home.resolve() / "homes" / "jessica"
-        self.assertTrue(runtime_home.is_symlink())
-        self.assertEqual(runtime_home.resolve(), self.jessica_home.resolve())
         result = subprocess.run(
             [str(SHIM), "exec", "hello"],
             cwd=str(self.root),
@@ -76,33 +73,47 @@ class CodexCliTest(unittest.TestCase):
             capture_output=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("CODEX_HOME=%s" % runtime_home, result.stdout)
+        self.assertIn("CODEX_HOME=%s" % self.jessica_home.resolve(), result.stdout)
         self.assertIn("ARGS=exec hello", result.stdout)
 
-    def test_existing_symlink_is_updated_but_real_path_is_preserved(self):
-        alternate_home = self.root / "alternate"
-        alternate_home.mkdir()
+    def test_interactive_alias_adds_no_daemon(self):
         self.run_manager("add", "jessica", "CODEX_HOME=" + str(self.jessica_home))
-        runtime_home = self.state_home.resolve() / "homes" / "jessica"
-        runtime_home.parent.mkdir(parents=True)
-        runtime_home.symlink_to(alternate_home, target_is_directory=True)
-
         self.run_manager("use", "jessica")
-        self.assertTrue(runtime_home.is_symlink())
-        self.assertEqual(runtime_home.resolve(), self.jessica_home.resolve())
-        self.assertTrue(self.jessica_home.is_dir())
-        self.assertTrue(alternate_home.is_dir())
+        result = subprocess.run(
+            [str(SHIM), "hello"],
+            cwd=str(self.root),
+            env=self.env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ARGS=--no-daemon hello", result.stdout)
 
-    def test_non_symlink_runtime_collision_is_not_removed(self):
+    def test_resume_alias_adds_no_daemon(self):
         self.run_manager("add", "jessica", "CODEX_HOME=" + str(self.jessica_home))
-        runtime_home = self.state_home.resolve() / "homes" / "jessica"
-        runtime_home.parent.mkdir(parents=True)
-        runtime_home.mkdir()
+        self.run_manager("use", "jessica")
+        result = subprocess.run(
+            [str(SHIM), "resume", "--last"],
+            cwd=str(self.root),
+            env=self.env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ARGS=--no-daemon resume --last", result.stdout)
 
-        result = self.run_manager("use", "jessica", check=False)
-        self.assertEqual(result.returncode, 2)
-        self.assertTrue(runtime_home.is_dir())
-        self.assertFalse(runtime_home.is_symlink())
+    def test_exec_alias_keeps_subcommand_arguments(self):
+        self.run_manager("add", "jessica", "CODEX_HOME=" + str(self.jessica_home))
+        self.run_manager("use", "jessica")
+        result = subprocess.run(
+            [str(SHIM), "exec", "hello"],
+            cwd=str(self.root),
+            env=self.env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ARGS=exec hello", result.stdout)
 
     def test_help_has_global_operations(self):
         result = self.run_manager("help")
