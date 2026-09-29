@@ -13,6 +13,7 @@ mkdir -p ~/.local/bin
 install -m 755 codex-cli codex ~/.local/bin/
 export PATH="$HOME/.local/bin:$PATH"
 hash -r 2>/dev/null || true
+rehash 2>/dev/null || true
 ```
 
 `~/.local/bin` 要排在 Homebrew 或 npm 安装的 Codex CLI 目录之前。可以用下面的命令确认当前实际执行的是 shim：
@@ -35,8 +36,8 @@ export CODEX_REAL_BIN=/opt/homebrew/bin/codex
 配置名对应一个已有的 `CODEX_HOME` 目录：
 
 ```bash
-codex-cli add jessica CODEX_HOME=/Users/jingwu/.antigravity_cockpit/instances/codex/cli-d139edad9e1e
-codex-cli add work CODEX_HOME=/Users/jingwu/.codex-work
+codex-cli add jessica CODEX_HOME=/Users/you/.antigravity_cockpit/instances/codex/cli-d139edad9e1e
+codex-cli add work CODEX_HOME=/Users/you/.codex-work
 ```
 
 目录必须已经存在。`codex-cli` 不复制、不读取、不修改目录里的 `auth.json`。
@@ -95,7 +96,7 @@ codex-cli help
   "active": "jessica",
   "profiles": {
     "jessica": {
-      "CODEX_HOME": "/Users/jingwu/.antigravity_cockpit/instances/codex/cli-d139edad9e1e"
+      "CODEX_HOME": "/Users/you/.antigravity_cockpit/instances/codex/cli-d139edad9e1e"
     }
   }
 }
