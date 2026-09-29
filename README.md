@@ -62,6 +62,8 @@ codex exec "检查当前目录"
 
 之后从任何工作区输入的 `codex` 都会使用 Jessica 对应的 `CODEX_HOME`。正在运行的 Codex 进程不会被重启；下一次启动的进程会使用新选择。
 
+如果别名指向 Cockpit 这类较长路径，启动时会通过 `~/.codex-cli/homes/jessica` 这样的短 symlink 注入 `CODEX_HOME`，以避开 macOS Unix socket 的路径长度限制。配置、登录态和会话仍保存在 `add` 指定的真实目录中；`codex-cli current` 会同时显示真实路径和运行时路径。
+
 ### 恢复官方配置
 
 ```bash
