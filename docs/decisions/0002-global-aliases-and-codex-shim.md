@@ -1,6 +1,6 @@
 # ADR 0002：用全局别名和 `codex` shim 切换 CODEX_HOME
 
-- 状态：已采用
+- 状态：Superseded by ADR 0005
 - 日期：2026-09-29
 - Supersedes：ADR 0001
 

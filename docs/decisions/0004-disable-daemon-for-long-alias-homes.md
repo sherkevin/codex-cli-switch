@@ -1,6 +1,6 @@
 # ADR 0004：长路径别名启动时关闭 Codex 共享 daemon
 
-- 状态：已采用
+- 状态：Superseded by ADR 0005
 - 日期：2026-09-29
 - Supersedes：ADR 0003
 
