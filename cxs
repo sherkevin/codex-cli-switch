@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""cxs: switch Codex CLI profiles and isolated CODEX_HOME directories.
+
+The command deliberately delegates configuration parsing to Codex.  It only
+creates the small, top-level profile files documented by Codex and keeps the
+selected profile/home in a separate, permission-restricted state file.
+"""
+from __future__ import print_function
+
+import argparse
+import ast
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+VERSION = "0.1.0"
+PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+COCKPIT_NAME_RE = re.compile(r"^cli-[A-Za-z0-9_-]+$")
+RESERVED_PROVIDERS = {"openai", "ollama", "lmstudio"}
+SENSITIVE_RE = re.compile(
+    r"(?:token|secret|password|api[_-]?key|authorization|cookie|bearer)", re.I
+)
+
+
+class CxsError(Exception):
+    """A user-facing error that should not produce a traceback."""
+
+
+def default_home():
+    value = os.environ.get("CODEX_HOME")
+    return Path(value).expanduser().resolve() if value else (Path.home() / ".codex").resolve()
+
+
+def manager_dir():
+    # This is intentionally based on the caller's normal CODEX_HOME, not the
+    # selected home.  Otherwise selecting a home would make the switch state
+    # disappear on the next invocation.
+    return default_home() / "cli-switch"
+
+
+def state_path():
+    return manager_dir() / "state.json"
+
+
+def cockpit_root():
+    return (Path.home() / ".antigravity_cockpit" / "instances" / "codex").resolve()
+
+
+def atomic_write(path, text, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd, tmp_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def load_state():
+    path = state_path()
+    if not path.exists():
+        return {"profile": None, "home": None}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise CxsError("无法读取状态文件 %s：%s" % (path, exc))
+    if not isinstance(data, dict):
+        raise CxsError("状态文件不是 JSON 对象：%s" % path)
+    profile = data.get("profile")
+    home = data.get("home")
+    if profile is not None and (not isinstance(profile, str) or not PROFILE_RE.match(profile)):
+        raise CxsError("状态文件中的 profile 名称非法：%s" % path)
+    if home is not None and (not isinstance(home, str) or not os.path.isabs(home)):
+        raise CxsError("状态文件中的 home 路径非法：%s" % path)
+    return {"profile": profile, "home": home}
+
+
+def save_state(state):
+    clean = {
+        "profile": state.get("profile"),
+        "home": state.get("home"),
+    }
+    atomic_write(state_path(), json.dumps(clean, indent=2) + "\n")
+
+
+def validate_profile_name(name):
+    if not isinstance(name, str) or not PROFILE_RE.match(name):
+        raise CxsError("非法 profile 名称：只允许字母、数字、-、_，且不能以 - 或 _ 开头")
+    return name
+
+
+def profile_file(home, name):
+    validate_profile_name(name)
+    return Path(home) / (name + ".config.toml")
+
+
+def selected_home(state):
+    if state.get("home"):
+        path = Path(state["home"]).expanduser().resolve()
+    else:
+        path = default_home()
+    return path
+
+
+def path_is_inside(child, parent):
+    try:
+        return os.path.commonpath([str(child), str(parent)]) == str(parent)
+    except ValueError:
+        return False
+
+
+def cockpit_home_from_ref(ref):
+    if not COCKPIT_NAME_RE.match(ref):
+        return None
+    root = cockpit_root()
+    candidate = (root / ref).resolve()
+    if not path_is_inside(candidate, root) or candidate.name != ref:
+        return None
+    if not candidate.is_dir():
+        return None
+    return candidate
+
+
+def resolve_home_ref(ref):
+    if ref in (None, "default", "default-home"):
+        return None
+    cockpit = cockpit_home_from_ref(ref)
+    if cockpit is not None:
+        return cockpit
+    path = Path(os.path.expanduser(ref)).resolve()
+    if not path.exists() or not path.is_dir():
+        raise CxsError("CODEX_HOME 目录不存在：%s" % path)
+    return path
+
+
+def home_label(path):
+    path = Path(path).resolve()
+    if path == default_home():
+        return "default"
+    root = cockpit_root()
+    if path_is_inside(path, root) and path.parent == root and COCKPIT_NAME_RE.match(path.name):
+        return path.name
+    return str(path)
+
+
+def profile_names(home):
+    if not Path(home).is_dir():
+        return []
+    return sorted(
+        p.name[: -len(".config.toml")]
+        for p in Path(home).glob("*.config.toml")
+        if p.is_file() and PROFILE_RE.match(p.name[: -len(".config.toml")])
+    )
+
+
+def parse_simple_value(raw):
+    raw = raw.strip()
+    # Values generated by cxs use JSON-compatible basic strings.  literal_eval
+    # also handles the common TOML booleans/numbers for a safe summary.
+    if raw.lower() == "true":
+        return True
+    if raw.lower() == "false":
+        return False
+    try:
+        return ast.literal_eval(raw)
+    except Exception:
+        return raw.strip('"\'')
+
+
+def safe_url(value):
+    if not isinstance(value, str):
+        return "<set>"
+    try:
+        parts = urlsplit(value)
+        if parts.scheme and parts.hostname:
+            host = parts.hostname
+            if ":" in host and not host.startswith("["):
+                host = "[" + host + "]"
+            port = (":" + str(parts.port)) if parts.port else ""
+            path = parts.path or ""
+            return "%s://%s%s%s" % (parts.scheme, host, port, path)
+    except Exception:
+        pass
+    return "<set>"
+
+
+def safe_toml_summary(path):
+    """Read only display-safe fields without requiring a TOML dependency."""
+    top = {}
+    providers = {}
+    sensitive = False
+    section = ""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise CxsError("无法读取 profile：%s" % exc)
+    for original in lines:
+        line = original.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            continue
+        if "=" not in line:
+            continue
+        key, raw = line.split("=", 1)
+        key = key.strip().strip('"')
+        if (
+            (SENSITIVE_RE.search(key) and key != "env_key")
+            or key.lower() in ("http_headers", "env_http_headers", "auth")
+            or section.endswith(".auth")
+        ):
+            sensitive = True
+            continue
+        value = parse_simple_value(raw)
+        if section.startswith("model_providers."):
+            provider = section[len("model_providers.") :].strip('"')
+            if provider not in providers:
+                providers[provider] = {}
+            if key in ("name", "wire_api", "env_key"):
+                providers[provider][key] = str(value)
+            elif key == "base_url":
+                providers[provider][key] = safe_url(value)
+        elif section == "" and key in (
+            "model",
+            "model_provider",
+            "model_reasoning_effort",
+            "review_model",
+            "openai_base_url",
+            "model_catalog_json",
+        ):
+            top[key] = safe_url(value) if key == "openai_base_url" else str(value)
+    return {"top": top, "providers": providers, "sensitive": sensitive}
+
+
+def file_mode(path):
+    try:
+        return stat.S_IMODE(Path(path).stat().st_mode)
+    except OSError:
+        return None
+
+
+def print_summary(name, path):
+    summary = safe_toml_summary(path)
+    print("Profile: %s" % name)
+    print("Path: %s" % Path(path).resolve())
+    mode = file_mode(path)
+    if mode is not None:
+        print("Permissions: %04o" % mode)
+    for key in ("model", "model_provider", "model_reasoning_effort", "review_model", "openai_base_url", "model_catalog_json"):
+        if key in summary["top"]:
+            print("%s: %s" % (key, summary["top"][key]))
+    if summary["providers"]:
+        print("Providers:")
+        for provider in sorted(summary["providers"]):
+            fields = summary["providers"][provider]
+            pieces = ["%s=%s" % (k, fields[k]) for k in ("name", "base_url", "env_key", "wire_api") if k in fields]
+            print("  %s%s" % (provider, (": " + ", ".join(pieces)) if pieces else ""))
+    if summary["sensitive"]:
+        print("Sensitive fields: present (values hidden)")
+
+
+def validate_url(value):
+    try:
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.netloc or parts.username or parts.password:
+            raise ValueError
+        if parts.query or parts.fragment:
+            raise ValueError
+        # Accessing port catches malformed values such as :abc.
+        _ = parts.port
+    except Exception:
+        raise CxsError("base URL 必须是不含凭据、query 或 fragment 的 http(s) URL")
+    return value.rstrip("/")
+
+
+def toml_string(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def cmd_list(_args):
+    state = load_state()
+    home = selected_home(state)
+    names = profile_names(home)
+    if not names:
+        print("当前 home 没有 profile：%s" % home)
+        return 0
+    active = state.get("profile")
+    for name in names:
+        marker = "*" if name == active else " "
+        print("%s %s" % (marker, name))
+    return 0
+
+
+def cmd_current(_args):
+    state = load_state()
+    home = selected_home(state)
+    print("Home: %s (%s)" % (home, home_label(home)))
+    profile = state.get("profile")
+    if profile:
+        path = profile_file(home, profile)
+        if path.exists():
+            print("Profile: %s" % profile)
+            print("Profile path: %s" % path)
+        else:
+            print("Profile: %s (missing: %s)" % (profile, path))
+            return 1
+    else:
+        print("Profile: <none>")
+    print("Config: %s" % (home / "config.toml"))
+    print("Auth file: %s" % ("present" if (home / "auth.json").exists() else "absent"))
+    return 0
+
+
+def cmd_use(args):
+    state = load_state()
+    home = selected_home(state)
+    path = profile_file(home, args.name)
+    if not path.is_file():
+        raise CxsError("profile 不存在：%s" % path)
+    state["profile"] = args.name
+    save_state(state)
+    print("已选择 profile %s（home=%s）" % (args.name, home_label(home)))
+    print("运行：cxs run    或把 `codex() { command cxs run \"$@\"; }` 加入 shell")
+    return 0
+
+
+def cmd_clear(_args):
+    state = load_state()
+    state["profile"] = None
+    save_state(state)
+    print("已清除当前 profile；cxs run 将使用 home 的基础配置")
+    return 0
+
+
+def cmd_new(args):
+    name = validate_profile_name(args.name)
+    if args.provider_id and not args.base_url:
+        raise CxsError("--provider-id 需要和 --base-url 一起使用")
+    if args.env_key and not args.base_url:
+        raise CxsError("--env-key 需要和 --base-url 一起使用")
+    provider_id = args.provider_id or name
+    if args.base_url and provider_id in RESERVED_PROVIDERS and provider_id != "openai":
+        raise CxsError("自定义 provider 不能使用保留 ID：%s" % provider_id)
+    if args.provider_id and not PROFILE_RE.match(provider_id):
+        raise CxsError("非法 provider ID：只允许字母、数字、-、_")
+    if provider_id == "openai" and args.env_key:
+        raise CxsError("内置 openai provider 不使用 --env-key；请让 Codex 读取 OPENAI_API_KEY")
+    if args.env_key and not ENV_RE.match(args.env_key):
+        raise CxsError("非法环境变量名：%s" % args.env_key)
+    base_url = validate_url(args.base_url) if args.base_url else None
+
+    state = load_state()
+    home = selected_home(state)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = profile_file(home, name)
+    if path.exists():
+        raise CxsError("profile 已存在（不会覆盖）：%s" % path)
+
+    lines = ["# Created by cxs. Values are a Codex configuration layer.", "model = %s" % toml_string(args.model)]
+    if args.reasoning_effort:
+        lines.append("model_reasoning_effort = %s" % toml_string(args.reasoning_effort))
+    if base_url and provider_id == "openai":
+        lines.extend([
+            "model_provider = \"openai\"",
+            "openai_base_url = %s" % toml_string(base_url),
+        ])
+    elif base_url:
+        lines.extend([
+            "model_provider = %s" % toml_string(provider_id),
+            "",
+            "[model_providers.%s]" % provider_id,
+            "name = %s" % toml_string(args.provider_name or provider_id),
+            "base_url = %s" % toml_string(base_url),
+            "wire_api = \"responses\"",
+        ])
+        if args.env_key:
+            lines.append("env_key = %s" % toml_string(args.env_key))
+    atomic_write(path, "\n".join(lines) + "\n")
+    print("已创建：%s" % path)
+    return 0
+
+
+def cmd_show(args):
+    state = load_state()
+    name = args.name or state.get("profile")
+    if not name:
+        raise CxsError("没有当前 profile；用 `cxs list` 或 `cxs show NAME`")
+    path = profile_file(selected_home(state), name)
+    if not path.is_file():
+        raise CxsError("profile 不存在：%s" % path)
+    print_summary(name, path)
+    return 0
+
+
+def cmd_path(args):
+    state = load_state()
+    name = args.name or state.get("profile")
+    if not name:
+        raise CxsError("没有当前 profile")
+    path = profile_file(selected_home(state), name)
+    if not path.is_file():
+        raise CxsError("profile 不存在：%s" % path)
+    print(path)
+    return 0
+
+
+def cmd_edit(args):
+    state = load_state()
+    name = args.name or state.get("profile")
+    if not name:
+        raise CxsError("没有当前 profile")
+    path = profile_file(selected_home(state), name)
+    if not path.is_file():
+        raise CxsError("profile 不存在：%s" % path)
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if editor:
+        command = shlex.split(editor) + [str(path)]
+        return subprocess.call(command)
+    if shutil.which("open"):
+        return subprocess.call(["open", "-t", str(path)])
+    if shutil.which("xdg-open"):
+        return subprocess.call(["xdg-open", str(path)])
+    print(path)
+    print("未找到 VISUAL/EDITOR；请手动编辑上面的文件")
+    return 0
+
+
+def cmd_homes(_args):
+    state = load_state()
+    active = selected_home(state)
+    rows = [("default", default_home())]
+    root = cockpit_root()
+    if root.is_dir():
+        for path in sorted(root.glob("cli-*")):
+            if path.is_dir() and COCKPIT_NAME_RE.match(path.name) and (path / "config.toml").is_file():
+                rows.append((path.name, path.resolve()))
+    if active not in [p for _, p in rows]:
+        rows.append(("custom", active))
+    for label, path in rows:
+        marker = "*" if path == active else " "
+        config = "config" if (path / "config.toml").is_file() else "no-config"
+        auth = "auth" if (path / "auth.json").is_file() else "no-auth"
+        print("%s %-12s %s [%s, %s]" % (marker, label, path, config, auth))
+    return 0
+
+
+def cmd_use_home(args):
+    state = load_state()
+    resolved = resolve_home_ref(args.ref)
+    state["home"] = str(resolved) if resolved is not None else None
+    new_home = selected_home(state)
+    if state.get("profile") and not profile_file(new_home, state["profile"]).is_file():
+        print("提示：profile %s 不存在于新 home，已清除 profile 选择" % state["profile"], file=sys.stderr)
+        state["profile"] = None
+    save_state(state)
+    print("已选择 home %s" % home_label(new_home))
+    print("注意：不要让 Cockpit 和 cxs 同时写同一个 CODEX_HOME", file=sys.stderr)
+    return 0
+
+
+def explicit_profile(args):
+    return any(arg == "-p" or arg == "--profile" or arg.startswith("--profile=") for arg in args)
+
+
+def cmd_run(args):
+    state = load_state()
+    home = selected_home(state)
+    if not home.exists() or not home.is_dir():
+        raise CxsError("CODEX_HOME 目录不存在：%s" % home)
+    profile = state.get("profile")
+    if profile and not profile_file(home, profile).is_file():
+        raise CxsError("当前 profile 不存在于 home：%s" % profile_file(home, profile))
+    codex = os.environ.get("CODEX_CLI_PATH") or shutil.which("codex")
+    if not codex:
+        raise CxsError("找不到 codex；请把 Codex CLI 放入 PATH，或设置 CODEX_CLI_PATH")
+    command = [codex]
+    if profile and not explicit_profile(args.codex_args):
+        command.extend(["--profile", profile])
+    command.extend(args.codex_args)
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(home)
+    os.execvpe(codex, command, env)
+    return 0
+
+
+def cmd_shell_init(args):
+    if args.shell == "fish":
+        print("function codex; command cxs run $argv; end")
+    else:
+        print("codex() { command cxs run \"$@\"; }")
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="cxs", description="切换 Codex CLI profile 与隔离 CODEX_HOME")
+    parser.add_argument("--version", action="version", version="cxs %s" % VERSION)
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("list", help="列出当前 home 的 profiles").set_defaults(func=cmd_list)
+    sub.add_parser("current", help="显示当前 home/profile（不显示密钥）").set_defaults(func=cmd_current)
+    sub.add_parser("clear", help="清除当前 profile").set_defaults(func=cmd_clear)
+    sub.add_parser("homes", help="列出默认和 Cockpit CLI homes").set_defaults(func=cmd_homes)
+
+    p = sub.add_parser("use", help="选择 profile")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_use)
+
+    p = sub.add_parser("use-home", help="选择 CODEX_HOME；用 default 回到 ~/.codex")
+    p.add_argument("ref")
+    p.set_defaults(func=cmd_use_home)
+
+    p = sub.add_parser("new", help="创建 profile，不覆盖已有文件")
+    p.add_argument("name")
+    p.add_argument("--model", required=True)
+    p.add_argument("--reasoning-effort")
+    p.add_argument("--base-url")
+    p.add_argument("--provider-id")
+    p.add_argument("--provider-name")
+    p.add_argument("--env-key", help="环境变量名；只写变量名，不写密钥值")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("show", help="显示 profile 脱敏摘要")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_show)
+
+    p = sub.add_parser("path", help="打印 profile 文件路径")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_path)
+
+    p = sub.add_parser("edit", help="用 VISUAL/EDITOR 编辑 profile")
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_edit)
+
+    p = sub.add_parser("run", help="用当前选择执行真实 codex（参数原样传递）")
+    p.add_argument("codex_args", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("shell-init", help="输出 shell 函数，让直接输入 codex 也走当前选择")
+    p.add_argument("shell", choices=("bash", "zsh", "fish"), nargs="?", default="zsh")
+    p.set_defaults(func=cmd_shell_init)
+    return parser
+
+
+def main(argv=None):
+    # `run` is a transparent pass-through.  Parse it before argparse so
+    # Codex's own leading options (for example `--profile` or `--model`) are
+    # not mistaken for cxs options.
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "run":
+        codex_args = raw[1:]
+        if codex_args[:1] == ["--"]:
+            codex_args = codex_args[1:]
+        try:
+            return int(cmd_run(argparse.Namespace(codex_args=codex_args)) or 0)
+        except CxsError as exc:
+            print("cxs: %s" % exc, file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print("cxs: 文件或进程操作失败：%s" % exc, file=sys.stderr)
+            return 2
+        except KeyboardInterrupt:
+            return 130
+    parser = build_parser()
+    args = parser.parse_args(raw)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    try:
+        return int(args.func(args) or 0)
+    except CxsError as exc:
+        print("cxs: %s" % exc, file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print("cxs: 文件或进程操作失败：%s" % exc, file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
