@@ -1,6 +1,6 @@
 # ADR 0001：用 Codex 原生 profile 和 `CODEX_HOME` 作为切换边界
 
-- 状态：已采用
+- 状态：Superseded by ADR 0002
 - 日期：2026-09-29
 
 ## 背景
