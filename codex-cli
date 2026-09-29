@@ -299,7 +299,10 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="codex-cli",
         description="全局切换 Codex CLI 的 CODEX_HOME 配置",
-        epilog="切换后请使用同目录的 codex shim，或执行 codex-cli run ...。",
+        epilog=(
+            "切换后请使用同目录的 codex shim，或执行 codex-cli run ...。"
+            " active alias 的交互启动会自动加入 --no-daemon，以兼容 macOS 长路径。"
+        ),
     )
     parser.add_argument("--version", action="version", version="codex-cli %s" % VERSION)
     sub = parser.add_subparsers(dest="command")
